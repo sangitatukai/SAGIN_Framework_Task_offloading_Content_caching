@@ -282,7 +282,7 @@ def main():
     print("   ✅ Complete system model implementation (Paper Equations 1-29)")
     print("   ✅ All four baseline approaches implemented and tested")
     print("   ✅ Proper C-band/Ka-band communication with TDMA/OFDMA")
-    print("   ✅ Spatiotemporal Zipf IoT activation patterns")
+    print("   ✅ Spatiotemporal Zipf IoT activation2 patterns")
     print("   ✅ Energy-aware system with realistic consumption models")
     print("   ✅ Content-aware task offloading with baseline strategies")
     print("   ✅ OFDM constraint enforcement and slot allocation")

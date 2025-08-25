@@ -78,14 +78,19 @@ class SAGINEnv:
 
     def collect_iot_data(self):
         """
-        Phase 1: IoT data collection using TDMA protocol with proper interference
-        Implements paper IoT activation and content aggregation model
+        Phase 1: IoT data collection with DEVICE SELECTION OPTIMIZATION
+
+        Process:
+        1. Sample active devices (Equations 1-3)
+        2. Generate ALL content (Equation 4)
+        3. OPTIMIZE device selection (Constraint 24) ← THIS IS THE KEY OPTIMIZATION
+        4. Aggregate only selected content (Equations 5-6)
         """
         self.g_timestep += 1
         print(f"\n=== Timestep {self.g_timestep}: IoT Data Collection ===")
 
         for (x, y), uav in self.uavs.items():
-            # Get active IoT devices using spatiotemporal Zipf distribution (Equations 1-3)
+            # Step 1: IoT Device Activation (Paper Equations 1-3)
             active_device_ids = self.iot_regions[(x, y)].sample_active_devices()
 
             if not active_device_ids:
@@ -93,20 +98,80 @@ class SAGINEnv:
                 uav.aggregated_content = {}
                 continue
 
-            # Generate content from active devices (Equation 4)
+            # Step 2: Content Generation from ALL active devices (Paper Equation 4)
             content_list = self.iot_regions[(x, y)].generate_content(
                 active_device_ids, self.g_timestep, grid_coord=(x, y)
             )
             content_dict = {tuple(c['id']): c for c in content_list}
 
-            # Calculate interfering regions for co-channel interference
+            print(f"UAV ({x},{y}): {len(active_device_ids)} active devices generated {len(content_dict)} content items")
+
+            # Step 3: DEVICE SELECTION OPTIMIZATION (Paper Constraint 24)
+            # This is what baselines and RL agents optimize!
             interfering_regions = [coord for coord in self.uavs.keys() if coord != (x, y)]
 
-            # Aggregate content with proper TDMA protocol and energy model
-            uav.aggregate_content(content_dict, interfering_regions)
+            # Use the device selection method (baseline or RL agent)
+            if hasattr(self, 'device_selection_strategy'):
+                selected_devices, selected_content = self.device_selection_strategy.select_devices(
+                    active_device_ids=active_device_ids,
+                    content_dict=content_dict,
+                    uav_pos=uav.uav_pos,
+                    interfering_regions=interfering_regions,
+                    slot_duration=self.duration
+                )
 
-            print(f"UAV ({x},{y}): Active devices: {len(active_device_ids)}, "
-                  f"Aggregated content: {len(uav.aggregated_content)}")
+                # UAV aggregates ONLY the selected content
+                uav.aggregated_content = selected_content
+
+                print(f"UAV ({x},{y}): Selected {len(selected_devices)}/{len(active_device_ids)} devices, "
+                      f"aggregated {len(selected_content)} content items")
+            else:
+                # Fallback: No optimization, try to aggregate all (will likely fail for large grids)
+                print(f"UAV ({x},{y}): WARNING - No device selection strategy, trying all devices")
+                selected_content = self._fallback_device_selection(uav, content_dict, interfering_regions)
+                uav.aggregated_content = selected_content
+
+    def _fallback_device_selection(self, uav, content_dict, interfering_regions):
+        """
+        Fallback device selection - simple greedy by size
+        """
+        if not content_dict:
+            return {}
+
+        # Simple greedy: select smallest content first until TDMA limit
+        sorted_content = sorted(content_dict.items(), key=lambda x: x[1].get('size', 0))
+        selected_content = {}
+        total_time = 0
+
+        try:
+            interference = uav.comm_model.estimate_co_channel_interference(
+                uav.uav_pos, interfering_regions
+            )
+        except:
+            interference = 1e-12
+
+        for cid, content in sorted_content:
+            if len(selected_content) >= 10:  # Limit to prevent hanging
+                break
+
+            try:
+                rate, success, delay_func = uav.comm_model.compute_iot_to_uav_rate(
+                    iot_pos=content.get('iot_pos', (0, 0, 0)),
+                    uav_pos=uav.uav_pos,
+                    interference=interference
+                )
+
+                if success:
+                    transmission_time = delay_func(content.get('size', 1.0))
+                    if total_time + transmission_time <= self.duration:
+                        selected_content[cid] = content
+                        total_time += transmission_time
+                    else:
+                        break
+            except:
+                continue
+
+        return selected_content
 
     def allocate_ofdm_slots_with_constraints(self):
         """

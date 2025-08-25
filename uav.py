@@ -41,7 +41,26 @@ class UAV:
 
         # Task generation parameters
         self.num_iot_per_region = num_iot_per_region
-        self.spatial_distribution = np.random.dirichlet(np.ones(X * Y))  # Spatial task preferences
+
+        # ========== ENHANCED TASK GENERATION PARAMETERS (REPLACE OLD) ==========
+        # Paper-compliant epoch-based parameters
+        self.epoch_length = 5  # E slots per epoch (configurable)
+        self.current_epoch = -1
+        self.current_epoch_preferences = None  # π(e)_{x,y} from Dirichlet
+
+        # Dirichlet concentration parameters (θ vector)
+        self.theta_base = 1.0  # Base concentration
+        self.theta_spatial_bias = 0.5  # Spatial preference bias
+        self.theta_self_preference = 2.0  # Preference for own region
+
+        # Spatiotemporal task Zipf parameters
+        self.alpha_task_base = 1.5  # Base task Zipf parameter
+        self.alpha_task_correlation = 0.3  # Correlation with IoT activation
+
+        # Historical tracking for temporal patterns
+        self.task_generation_history = {}  # Track temporal patterns
+
+        # DO NOT ADD: self.spatial_distribution - THIS IS OLD AND REMOVED
 
         # Temporal state
         self.current_time = 0
@@ -49,6 +68,201 @@ class UAV:
 
         # Neighbor communication
         self.neighbor_links = {}
+
+    def update_epoch_preferences(self, timestep):
+        """
+        Update region preferences using Dirichlet distribution per epoch
+        Implements Paper Equation: π(e)_{x,y} ~ Dirichlet(θ)
+        """
+        current_epoch = timestep // self.epoch_length
+
+        # Update preferences at the start of each epoch
+        if current_epoch != self.current_epoch:
+            self.current_epoch = current_epoch
+
+            # Create concentration vector θ with spatial and temporal biases
+            theta = np.ones(self.X * self.Y) * self.theta_base
+
+            # Add spatial bias - preference for nearby regions
+            x, y = self.pos
+            for i in range(self.X):
+                for j in range(self.Y):
+                    region_idx = i * self.Y + j
+                    # Distance-based bias
+                    distance = np.sqrt((i - x) ** 2 + (j - y) ** 2)
+                    theta[region_idx] += self.theta_spatial_bias * np.exp(-distance / 2.0)
+
+            # Add self-preference (tasks more likely to target own region)
+            own_region_idx = x * self.Y + y
+            theta[own_region_idx] += self.theta_self_preference
+
+            # Add temporal variation based on epoch
+            temporal_factor = 0.5 * np.sin(2 * np.pi * current_epoch / 10)  # 10-epoch cycle
+            theta += temporal_factor
+
+            # Ensure all concentrations are positive
+            theta = np.maximum(theta, 0.1)
+
+            # Sample region preferences from Dirichlet distribution
+            self.current_epoch_preferences = np.random.dirichlet(theta)
+
+            print(f"UAV {self.pos}: Updated epoch {current_epoch} preferences - "
+                  f"Own region preference: {self.current_epoch_preferences[own_region_idx]:.3f}")
+
+    def get_spatiotemporal_task_zipf_parameter(self, target_region, timestep):
+        """
+        Calculate spatiotemporal Zipf parameter for task device selection
+        Correlates with IoT activation patterns but with variation
+        """
+        target_x, target_y = target_region
+
+        # Get IoT activation Zipf parameter if available
+        if self.region and hasattr(self.region, 'current_zipf_param'):
+            iot_alpha = self.region.current_zipf_param
+        else:
+            # Fallback calculation matching IoT region pattern
+            # α_{x,y}(t) = a_base + φ_spatial(x,y) + φ_temporal(t,x,y)
+            a_base = np.random.uniform(1.2, 2.5)
+            phi_spatial = ((target_x * 3 + target_y * 2) % 5) * 0.3
+            phi_temporal = 0.6 * np.sin((2 * np.pi * timestep / 20) + target_x + target_y)
+            iot_alpha = a_base + phi_spatial + phi_temporal
+
+        # Task Zipf parameter with correlation to IoT but slight variation
+        alpha_task = (self.alpha_task_base +
+                      self.alpha_task_correlation * iot_alpha +
+                      0.2 * np.random.normal(0, 0.1))  # Small noise
+
+        # Ensure reasonable bounds
+        alpha_task = np.clip(alpha_task, 1.0, 3.0)
+
+        return alpha_task
+
+    def select_device_with_spatiotemporal_zipf(self, target_region, timestep):
+        """
+        Select IoT device using spatiotemporal Zipf distribution
+        Implements proper device selection as described in paper
+        """
+        alpha_task = self.get_spatiotemporal_task_zipf_parameter(target_region, timestep)
+
+        # Generate Zipf probabilities for device ranking
+        ranks = np.arange(1, self.num_iot_per_region + 1)
+        zipf_probs = np.power(ranks, -alpha_task)
+        zipf_probs = zipf_probs / zipf_probs.sum()  # Normalize
+
+        # Sample device according to Zipf distribution
+        try:
+            selected_device = np.random.choice(self.num_iot_per_region, p=zipf_probs)
+            return selected_device
+        except ValueError:
+            # Fallback in case of numerical issues
+            return np.random.randint(0, self.num_iot_per_region)
+
+
+    # 3. COMPLETELY REPLACE THE generate_tasks METHOD:
+
+    def generate_tasks(self, X, Y, timestep, num_tasks=5):
+        """
+        Generate content-aware tasks following paper model exactly
+        Implements Paper Section D: Task Generation with epochs and Dirichlet distribution
+        """
+        # Update epoch preferences if needed
+        self.update_epoch_preferences(timestep)
+
+        tasks = []
+        base_time = timestep * self.duration
+
+        # Determine number of tasks to generate (with some randomness)
+        num_tasks_to_generate = np.random.randint(max(1, num_tasks - 2), num_tasks + 3)
+
+        # Generate tasks at random times within the slot
+        if num_tasks_to_generate > self.duration:
+            num_tasks_to_generate = self.duration
+
+        task_offsets = sorted(np.random.choice(range(self.duration),
+                                               size=num_tasks_to_generate,
+                                               replace=False))
+
+        # Spatial indices for all regions
+        spatial_indices = [(i, j) for i in range(X) for j in range(Y)]
+
+        for offset in task_offsets:
+            # ========== PAPER-COMPLIANT REGION SELECTION ==========
+            # Select target region using current epoch Dirichlet preferences
+            region_idx = np.random.choice(len(spatial_indices),
+                                          p=self.current_epoch_preferences)
+            target_x, target_y = spatial_indices[region_idx]
+
+            # ========== PAPER-COMPLIANT DEVICE SELECTION ==========
+            # Select device using spatiotemporal Zipf distribution
+            device_id = self.select_device_with_spatiotemporal_zipf(
+                (target_x, target_y), timestep)
+
+            # ========== PAPER-COMPLIANT TASK CREATION ==========
+            # Create task following Equation 13: T(i)_{x,y}(t) = {ID(m)_{x',y'}, γ(i)_{x,y}, TTL(i)_{x,y}}
+            task = {
+                'task_id': np.random.randint(100000, 999999),
+                'required_cpu': np.random.randint(1, 10),  # γ(i)_{x,y}(t) - CPU cycles
+                'delay_bound': np.random.uniform(1.0, 15.0),  # TTL(i)_{x,y}(t) - deadline
+                'content_id': (target_x, target_y, device_id),  # ID(m)_{x',y'} - content reference
+                'generation_time': base_time + offset,  # Generation timestamp
+                'size': np.random.uniform(0.5, 3.0),  # Task data size in MB
+                'remaining_cpu': None,  # Will be set during processing
+
+                # Additional metadata for analysis
+                'epoch': self.current_epoch,
+                'target_region_preference': self.current_epoch_preferences[region_idx],
+                'alpha_task_used': self.get_spatiotemporal_task_zipf_parameter((target_x, target_y), timestep)
+            }
+
+            tasks.append(task)
+
+        # Update generation history for analysis
+        self.task_generation_history[timestep] = {
+            'num_tasks': len(tasks),
+            'epoch': self.current_epoch,
+            'target_regions': [t['content_id'][:2] for t in tasks],
+            'avg_preference': np.mean([t['target_region_preference'] for t in tasks]) if tasks else 0
+        }
+
+        print(f"UAV {self.pos}: Generated {len(tasks)} tasks for timestep {timestep} "
+              f"(epoch {self.current_epoch})")
+
+        # Print some analysis
+        if tasks:
+            own_region_tasks = sum(1 for t in tasks if t['content_id'][:2] == self.pos)
+            cross_region_tasks = len(tasks) - own_region_tasks
+            print(f"   Own region: {own_region_tasks}, Cross-region: {cross_region_tasks}")
+
+        return tasks
+
+    def get_task_generation_statistics(self):
+        """
+        Get statistics about task generation patterns for analysis
+        """
+        if not self.task_generation_history:
+            return {}
+
+        total_tasks = sum(h['num_tasks'] for h in self.task_generation_history.values())
+        epochs_used = len(set(h['epoch'] for h in self.task_generation_history.values()))
+
+        # Calculate region diversity
+        all_targets = []
+        for h in self.task_generation_history.values():
+            all_targets.extend(h['target_regions'])
+
+        unique_regions = len(set(all_targets))
+        total_regions = self.X * self.Y
+
+        return {
+            'total_tasks_generated': total_tasks,
+            'epochs_seen': epochs_used,
+            'region_diversity': unique_regions / total_regions if total_regions > 0 else 0,
+            'avg_tasks_per_timestep': total_tasks / len(
+                self.task_generation_history) if self.task_generation_history else 0,
+            'cross_region_ratio': sum(1 for target in all_targets if target != self.pos) / len(
+                all_targets) if all_targets else 0
+        }
+
 
     def aggregate_content(self, content_dict, interfering_regions):
         """
@@ -65,63 +279,41 @@ class UAV:
 
         # Calculate interference from other regions
         interference = self.comm_model.estimate_co_channel_interference(
-            self.uav_pos, interfering_regions
-        )
+            source_regions=interfering_regions, target_region=self.pos)
 
-        # Sort content by size for optimal TDMA scheduling (smallest first)
+        # Sort content by priority (smaller content first for efficiency)
         sorted_content = sorted(content_dict.items(), key=lambda x: x[1]['size'])
 
-        print(f"UAV {self.pos}: Aggregating {len(content_dict)} content items with interference {interference:.2e}W")
-
-        for cid, content in sorted_content:
-            iot_pos = content['iot_pos']
-
-            # Use paper-compliant communication model (Equation 5)
-            rate, success, delay_func = self.comm_model.compute_iot_to_uav_rate(
-                iot_pos=iot_pos,
-                uav_pos=self.uav_pos,
-                interference=interference,
-                fading=1.0  # Assume nominal channel conditions
-            )
-
-            if not success or rate <= 0:
-                print(f"UAV {self.pos}: Failed to establish link with IoT device at {iot_pos}")
-                continue
-
-            # Calculate transmission delay (Equation 6)
-            transmission_delay = delay_func(content['size'])
-
-            # Check TDMA slot constraint - ensure all transmissions fit in slot
-            if total_time_used + transmission_delay > slot_duration:
-                print(f"UAV {self.pos}: TDMA slot full ({total_time_used:.2f}s), dropping content {cid}")
+        for content_id, content in sorted_content:
+            if total_time_used >= slot_duration:
+                print(f"UAV {self.pos}: TDMA slot exhausted, remaining content dropped")
                 break
 
-            # Update content with UAV receive time
-            receive_time = content['generation_time'] + total_time_used + transmission_delay
-            content['received_by_uav'] = receive_time
-            content['transmission_delay'] = transmission_delay
-            content['data_rate'] = rate
+            # Calculate transmission time with interference (Paper Equation 6)
+            transmission_time = self.comm_model.calculate_transmission_delay(
+                content_size=content['size'], interference=interference)
 
-            # Add to aggregated content
-            aggregated[cid] = content
-            total_time_used += transmission_delay
+            if total_time_used + transmission_time <= slot_duration:
+                # Content can be aggregated within slot
+                aggregated[content_id] = content.copy()
+                aggregated[content_id]['received_by_uav'] = total_time_used
+                total_time_used += transmission_time
 
-            # Calculate communication energy (Paper Equation 19)
-            # E^cm_{x,y}(t) = Σ[p^(m)_tx × τ^(m)_tx(t) + p^(m)_rx × τ^(m)_rx(t)]
-            p_rx = 0.5  # UAV reception power (Watts)
-            tau_rx = transmission_delay  # Reception duration
-            communication_energy = p_rx * tau_rx
+                # Calculate and deduct communication energy (Paper Equation 19)
+                comm_energy = self.comm_model.calculate_communication_energy(
+                    content_size=content['size'], transmission_time=transmission_time)
+                self.energy -= comm_energy
+                self.energy_used_this_slot += comm_energy
 
-            # Deduct energy
-            self.energy -= communication_energy
-            self.energy_used_this_slot += communication_energy
-
-            print(
-                f"UAV {self.pos}: Aggregated {cid}, delay={transmission_delay:.3f}s, energy={communication_energy:.2f}J")
+                print(f"UAV {self.pos}: Aggregated content {content_id} "
+                      f"(size: {content['size']:.1f}MB, time: {transmission_time:.2f}s, "
+                      f"energy: {comm_energy:.4f}J)")
+            else:
+                print(f"UAV {self.pos}: Content {content_id} too large for remaining TDMA slot")
 
         self.aggregated_content = aggregated
-        print(f"UAV {self.pos}: Successfully aggregated {len(aggregated)}/{len(content_dict)} items, "
-              f"total_time={total_time_used:.2f}s/{slot_duration}s")
+        print(f"UAV {self.pos}: Total aggregation time: {total_time_used:.2f}s/{slot_duration}s")
+
 
     def upload_to_satellite_with_proper_protocol(self, satellite, subchannel_assigned=False):
         """
@@ -405,44 +597,6 @@ class UAV:
 
         return completed
 
-    def generate_tasks(self, X, Y, timestep, num_tasks=5):
-        """
-        Generate content-aware tasks with cross-region requests
-        Implements task generation model from paper
-        """
-        tasks = []
-        base_time = timestep * self.duration
-
-        # Use spatial distribution for cross-region task generation
-        spatial_indices = [(i, j) for i in range(X) for j in range(Y)]
-        num_tasks_to_generate = np.random.randint(1, num_tasks + 1)
-
-        # Generate tasks at random times within the slot
-        task_offsets = sorted(np.random.choice(range(self.duration), size=num_tasks_to_generate, replace=False))
-
-        for offset in task_offsets:
-            # Select target region based on spatial distribution
-            region_idx = np.random.choice(len(spatial_indices), p=self.spatial_distribution)
-            target_x, target_y = spatial_indices[region_idx]
-
-            # Select device within target region
-            device_id = np.random.randint(0, self.num_iot_per_region)
-
-            # Create task
-            task = {
-                'task_id': np.random.randint(100000, 999999),
-                'required_cpu': np.random.randint(1, 10),  # CPU cycles required
-                'delay_bound': np.random.uniform(1.0, 15.0),  # TTL in seconds
-                'content_id': (target_x, target_y, device_id),
-                'generation_time': base_time + offset,
-                'size': np.random.uniform(0.5, 3.0),  # Task data size in MB
-                'remaining_cpu': None  # Will be set during processing
-            }
-
-            tasks.append(task)
-
-        print(f"UAV {self.pos}: Generated {len(tasks)} tasks for timestep {timestep}")
-        return tasks
 
     def clear_aggregated_content(self):
         """Clear aggregated IoT content after caching decision"""

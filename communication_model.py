@@ -166,36 +166,73 @@ class CommunicationModel:
 
         return rate, success, transmission_delay_func
 
-    def estimate_co_channel_interference(self, victim_uav_pos, interfering_regions, region_size=(100, 100)):
+    def estimate_co_channel_interference(self, victim_uav_pos=None, interfering_regions=None,
+                                         region_size=(100, 100), source_regions=None,
+                                         target_region=None, **kwargs):
         """
+        FIXED: Paper-compliant co-channel interference calculation with backward compatibility
+
         Estimate co-channel interference I_{x,y}(t) from other IoT regions
-        Used in Equation (5) for IoT-to-UAV communication
+        Used in Paper Equation (5): SINR = P_m * G^(m)_{x,y}(t) / (I_{x,y}(t) + σ²)
+
+        Parameters:
+        - victim_uav_pos: 3D position of UAV receiving interference (new style)
+        - interfering_regions: List of (x,y) region coordinates (new style)
+        - source_regions: Same as interfering_regions (old style - for compatibility)
+        - target_region: (x,y) coordinate of victim UAV (old style - for compatibility)
+        - region_size: Physical size of each region in meters
         """
+        import numpy as np
+
+        # Handle backward compatibility with old parameter names
+        if victim_uav_pos is None and target_region is not None:
+            # Convert old style target_region (x,y) to 3D UAV position
+            target_x, target_y = target_region
+            victim_uav_pos = (
+                target_x * region_size[0] + region_size[0] / 2,  # X coordinate
+                target_y * region_size[1] + region_size[1] / 2,  # Y coordinate
+                100  # Assume UAV altitude of 100m
+            )
+
+        if interfering_regions is None and source_regions is not None:
+            # Use old style parameter name
+            interfering_regions = source_regions
+
+        # Fallback handling
+        if interfering_regions is None:
+            interfering_regions = []
+
+        if victim_uav_pos is None:
+            # No valid UAV position, return base noise only
+            return 1e-12  # Base thermal noise
+
+        # Paper-compliant interference calculation
         total_interference = 0.0
 
         for region_coord in interfering_regions:
             region_x, region_y = region_coord
-            # Assume one active IoT transmitter per region at region center
+
+            # Calculate interferer position (IoT device at region center, ground level)
             interferer_pos = (
                 region_x * region_size[0] + region_size[0] / 2,
                 region_y * region_size[1] + region_size[1] / 2,
                 0  # Ground level
             )
 
-            # Distance from interferer to victim UAV
+            # Calculate 3D distance from interferer to victim UAV
             distance = np.linalg.norm(np.array(interferer_pos) - np.array(victim_uav_pos))
             if distance <= 0:
-                continue
+                continue  # Skip if same location
 
-            # Path loss for interference signal
+            # Calculate path loss using paper frequency (C-band: 6 GHz)
             path_loss = self.compute_path_loss(distance, self.C_BAND_FREQ)
 
-            # Interference power (same transmit power as useful signal)
+            # Calculate interference power using paper parameters
+            # Interference = P_IOT * G_IOT / path_loss
             interference_power = self.P_IOT * self.G_IOT / path_loss
             total_interference += interference_power
 
         return total_interference
-
     def check_tdma_feasibility(self, content_sizes, slot_duration):
         """
         Check if all content can be transmitted within TDMA slot duration

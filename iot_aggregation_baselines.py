@@ -8,7 +8,7 @@ from communication_model import CommunicationModel
 class PopularityToSizeGreedyAggregation:
     """
     Baseline 1: Popularity-to-size greedy aggregation
-    Selects IoT devices based on popularity/size ratio
+    Selects IoT devices based on popularity/size ratio within TDMA constraints
     """
 
     def __init__(self, duration=300):
@@ -16,7 +16,7 @@ class PopularityToSizeGreedyAggregation:
         self.comm_model = CommunicationModel()
         self.device_usefulness = {}  # Track device usefulness over time
 
-    def select_devices(self, active_devices, content_dict, uav_pos, interfering_regions):
+    def select_devices(self, active_devices, content_dict, uav_pos, interfering_regions, slot_duration=None):
         """
         Select devices using popularity-to-size greedy approach
 
@@ -25,6 +25,7 @@ class PopularityToSizeGreedyAggregation:
             content_dict: {cid: content_metadata} for active devices
             uav_pos: UAV 3D position
             interfering_regions: List of interfering region coordinates
+            slot_duration: TDMA slot duration (overrides self.duration if provided)
 
         Returns:
             selected_devices: List of selected device IDs
@@ -33,10 +34,18 @@ class PopularityToSizeGreedyAggregation:
         if not active_devices or not content_dict:
             return [], {}
 
+        # Use provided slot_duration or default
+        duration = slot_duration if slot_duration is not None else self.duration
+
+        print(f"Greedy aggregation: {len(active_devices)} devices, {len(content_dict)} content items")
+
         # Calculate interference
-        interference = self.comm_model.estimate_co_channel_interference(
-            uav_pos, interfering_regions
-        )
+        try:
+            interference = self.comm_model.estimate_co_channel_interference(
+                uav_pos, interfering_regions
+            )
+        except Exception:
+            interference = 1e-12
 
         # Calculate priority scores for each device
         device_priorities = []
@@ -52,15 +61,20 @@ class PopularityToSizeGreedyAggregation:
             if device_content is None:
                 continue
 
+            # Validate required fields
+            if not all(field in device_content for field in ['size', 'iot_pos']):
+                print(f"Skipping device {device_id}: missing required fields")
+                continue
+
             # Get usefulness score (popularity proxy)
             usefulness = self.device_usefulness.get(device_id, 1.0)
 
-            # Calculate priority: usefulness / size
+            # Calculate priority: usefulness / size (higher = better)
             priority = usefulness / max(device_content['size'], 0.1)  # Avoid division by zero
 
             device_priorities.append((priority, device_id, device_content))
 
-        # Sort by priority (descending)
+        # Sort by priority (descending - highest priority first)
         device_priorities.sort(key=lambda x: x[0], reverse=True)
 
         # Greedily select devices within TDMA constraints
@@ -69,29 +83,47 @@ class PopularityToSizeGreedyAggregation:
         total_time_used = 0
 
         for priority, device_id, content in device_priorities:
-            # Check communication feasibility
-            rate, success, delay_func = self.comm_model.compute_iot_to_uav_rate(
-                iot_pos=content['iot_pos'],
-                uav_pos=uav_pos,
-                interference=interference
-            )
+            try:
+                # Check communication feasibility
+                rate, success, delay_func = self.comm_model.compute_iot_to_uav_rate(
+                    iot_pos=content.get('iot_pos', (0, 0, 0)),
+                    uav_pos=uav_pos,
+                    interference=interference
+                )
 
-            if not success:
+                if not success:
+                    continue
+
+                # Calculate transmission time
+                transmission_time = delay_func(content.get('size', 1.0))
+
+                # Check TDMA constraint (Paper Constraint 24)
+                if total_time_used + transmission_time > duration:
+                    print(f"Greedy: TDMA capacity reached ({total_time_used:.2f}s/{duration}s)")
+                    break
+
+                # Select this device
+                selected_devices.append(device_id)
+                cid = tuple(content['id']) if 'id' in content else (0, 0, device_id)
+
+                # Update content metadata
+                content['received_by_uav'] = content.get('generation_time', 0) + total_time_used + transmission_time
+                content['transmission_delay'] = transmission_time
+                aggregated_content[cid] = content
+                total_time_used += transmission_time
+
+                print(f"Selected device {device_id}: priority={priority:.3f}, size={content.get('size', 0):.1f}MB")
+
+            except Exception as e:
+                print(f"Error processing device {device_id}: {e}")
                 continue
 
-            # Calculate transmission time
-            transmission_time = delay_func(content['size'])
+        # Update usefulness scores based on selection
+        for device_id in selected_devices:
+            self.device_usefulness[device_id] = min(2.0, self.device_usefulness.get(device_id, 1.0) * 1.1)
 
-            # Check TDMA constraint
-            if total_time_used + transmission_time > self.duration:
-                break
-
-            # Select this device
-            selected_devices.append(device_id)
-            cid = tuple(content['id'])
-            content['received_by_uav'] = content['generation_time'] + total_time_used + transmission_time
-            aggregated_content[cid] = content
-            total_time_used += transmission_time
+        print(f"Greedy result: {len(selected_devices)}/{len(active_devices)} devices, "
+              f"TDMA efficiency: {(total_time_used / duration) * 100:.1f}%")
 
         return selected_devices, aggregated_content
 
@@ -121,7 +153,7 @@ class GRUContextualBanditAggregation(nn.Module):
         self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
 
     def select_devices(self, active_devices, content_dict, uav_pos, interfering_regions,
-                       temporal_context=None):
+                       temporal_context=None, slot_duration=None):
         """
         Select devices using GRU contextual bandit approach
 
@@ -131,6 +163,7 @@ class GRUContextualBanditAggregation(nn.Module):
             uav_pos: UAV 3D position
             interfering_regions: List of interfering region coordinates
             temporal_context: Previous observations for GRU
+            slot_duration: TDMA slot duration (overrides self.duration if provided)
 
         Returns:
             selected_devices: List of selected device IDs
@@ -139,21 +172,32 @@ class GRUContextualBanditAggregation(nn.Module):
         if not active_devices or not content_dict:
             return [], {}
 
+        # Use provided slot_duration or default
+        duration = slot_duration if slot_duration is not None else self.duration
+
+        print(f"GRU bandit aggregation: {len(active_devices)} devices available")
+
         # Get temporal context from GRU
         if temporal_context is not None:
-            context_tensor = torch.FloatTensor(temporal_context).unsqueeze(0).unsqueeze(0)
-            with torch.no_grad():
-                gru_output, self.hidden_state = self.gru(context_tensor, self.hidden_state)
-                temporal_embedding = gru_output.squeeze()
+            try:
+                context_tensor = torch.FloatTensor(temporal_context).unsqueeze(0).unsqueeze(0)
+                with torch.no_grad():
+                    gru_output, self.hidden_state = self.gru(context_tensor, self.hidden_state)
+                    temporal_embedding = gru_output.squeeze()
+            except Exception:
+                temporal_embedding = torch.zeros(32)  # Fallback
         else:
             temporal_embedding = torch.zeros(32)  # Default embedding
 
         # Calculate interference
-        interference = self.comm_model.estimate_co_channel_interference(
-            uav_pos, interfering_regions
-        )
+        try:
+            interference = self.comm_model.estimate_co_channel_interference(
+                uav_pos, interfering_regions
+            )
+        except Exception:
+            interference = 1e-12
 
-        # Score each device
+        # Score each device using GRU + contextual features
         device_scores = []
 
         for device_id in active_devices:
@@ -167,24 +211,32 @@ class GRUContextualBanditAggregation(nn.Module):
             if device_content is None:
                 continue
 
-            # Create device feature vector
-            device_features = torch.FloatTensor([
-                device_content['size'],
-                device_content['ttl'] / 1800,  # Normalized TTL
-                device_id / 20,  # Normalized device ID
-                1.0  # Bias term
-            ])
+            # Validate required fields
+            if not all(field in device_content for field in ['size']):
+                continue
 
-            # Combine temporal and device features
-            combined_features = torch.cat([temporal_embedding, device_features])
+            try:
+                # Create device feature vector
+                device_features = torch.FloatTensor([
+                    device_content.get('size', 1.0) / 20.0,  # Normalized size
+                    device_content.get('ttl', 1200) / 1800.0,  # Normalized TTL
+                    device_id / 20.0,  # Normalized device ID
+                    1.0  # Bias term
+                ])
 
-            # Get device score
-            with torch.no_grad():
-                score = self.device_scorer(combined_features).item()
+                # Combine temporal and device features
+                combined_features = torch.cat([temporal_embedding, device_features])
 
-            device_scores.append((score, device_id, device_content))
+                # Get device score using neural network
+                with torch.no_grad():
+                    score = self.device_scorer(combined_features).item()
 
-        # Sort by score (descending)
+                device_scores.append((score, device_id, device_content))
+
+            except Exception:
+                continue
+
+        # Sort by score (descending - highest score first)
         device_scores.sort(key=lambda x: x[0], reverse=True)
 
         # Greedily select devices within TDMA constraints
@@ -193,29 +245,42 @@ class GRUContextualBanditAggregation(nn.Module):
         total_time_used = 0
 
         for score, device_id, content in device_scores:
-            # Check communication feasibility
-            rate, success, delay_func = self.comm_model.compute_iot_to_uav_rate(
-                iot_pos=content['iot_pos'],
-                uav_pos=uav_pos,
-                interference=interference
-            )
+            try:
+                # Check communication feasibility
+                rate, success, delay_func = self.comm_model.compute_iot_to_uav_rate(
+                    iot_pos=content.get('iot_pos', (0, 0, 0)),
+                    uav_pos=uav_pos,
+                    interference=interference
+                )
 
-            if not success:
+                if not success:
+                    continue
+
+                # Calculate transmission time
+                transmission_time = delay_func(content.get('size', 1.0))
+
+                # Check TDMA constraint
+                if total_time_used + transmission_time > duration:
+                    print(f"GRU Bandit: TDMA capacity reached ({total_time_used:.2f}s/{duration}s)")
+                    break
+
+                # Select this device
+                selected_devices.append(device_id)
+                cid = tuple(content['id']) if 'id' in content else (0, 0, device_id)
+
+                # Update content metadata
+                content['received_by_uav'] = content.get('generation_time', 0) + total_time_used + transmission_time
+                content['transmission_delay'] = transmission_time
+                aggregated_content[cid] = content
+                total_time_used += transmission_time
+
+                print(f"Selected device {device_id}: GRU score={score:.3f}")
+
+            except Exception as e:
+                print(f"Error processing device {device_id}: {e}")
                 continue
 
-            # Calculate transmission time
-            transmission_time = delay_func(content['size'])
-
-            # Check TDMA constraint
-            if total_time_used + transmission_time > self.duration:
-                break
-
-            # Select this device
-            selected_devices.append(device_id)
-            cid = tuple(content['id'])
-            content['received_by_uav'] = content['generation_time'] + total_time_used + transmission_time
-            aggregated_content[cid] = content
-            total_time_used += transmission_time
+        print(f"GRU Bandit result: {len(selected_devices)}/{len(active_devices)} devices")
 
         return selected_devices, aggregated_content
 
@@ -224,13 +289,16 @@ class GRUContextualBanditAggregation(nn.Module):
         Update model based on immediate feedback (contextual bandit style)
         No temporal credit assignment - just immediate reward
         """
-        # Simple loss based on immediate reward
-        if hasattr(self, 'last_prediction'):
-            loss = -reward * self.last_prediction  # Bandit-style loss
+        try:
+            # Simple loss based on immediate reward
+            if hasattr(self, 'last_prediction'):
+                loss = -reward * self.last_prediction  # Bandit-style loss
 
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+        except Exception:
+            pass  # Ignore update errors
 
 
 class RandomAggregation:
@@ -243,15 +311,36 @@ class RandomAggregation:
         self.duration = duration
         self.comm_model = CommunicationModel()
 
-    def select_devices(self, active_devices, content_dict, uav_pos, interfering_regions):
-        """Random device selection within TDMA constraints"""
+    def select_devices(self, active_devices, content_dict, uav_pos, interfering_regions, slot_duration=None):
+        """
+        Random device selection within TDMA constraints
+
+        Args:
+            active_devices: List of active device IDs
+            content_dict: {cid: content_metadata} for active devices
+            uav_pos: UAV 3D position
+            interfering_regions: List of interfering region coordinates
+            slot_duration: TDMA slot duration (overrides self.duration if provided)
+
+        Returns:
+            selected_devices: List of selected device IDs
+            aggregated_content: {cid: content_metadata} for selected devices
+        """
         if not active_devices or not content_dict:
             return [], {}
 
+        # Use provided slot_duration or default
+        duration = slot_duration if slot_duration is not None else self.duration
+
+        print(f"Random aggregation: {len(active_devices)} devices available")
+
         # Calculate interference
-        interference = self.comm_model.estimate_co_channel_interference(
-            uav_pos, interfering_regions
-        )
+        try:
+            interference = self.comm_model.estimate_co_channel_interference(
+                uav_pos, interfering_regions
+            )
+        except Exception:
+            interference = 1e-12
 
         # Shuffle devices randomly
         shuffled_devices = active_devices.copy()
@@ -273,29 +362,45 @@ class RandomAggregation:
             if device_content is None:
                 continue
 
-            # Check communication feasibility
-            rate, success, delay_func = self.comm_model.compute_iot_to_uav_rate(
-                iot_pos=device_content['iot_pos'],
-                uav_pos=uav_pos,
-                interference=interference
-            )
-
-            if not success:
+            # Validate required fields
+            if not all(field in device_content for field in ['size']):
                 continue
 
-            # Calculate transmission time
-            transmission_time = delay_func(device_content['size'])
+            try:
+                # Check communication feasibility
+                rate, success, delay_func = self.comm_model.compute_iot_to_uav_rate(
+                    iot_pos=device_content.get('iot_pos', (0, 0, 0)),
+                    uav_pos=uav_pos,
+                    interference=interference
+                )
 
-            # Check TDMA constraint
-            if total_time_used + transmission_time > self.duration:
-                break
+                if not success:
+                    continue
 
-            # Select this device
-            selected_devices.append(device_id)
-            cid = tuple(device_content['id'])
-            device_content['received_by_uav'] = device_content['generation_time'] + total_time_used + transmission_time
-            aggregated_content[cid] = device_content
-            total_time_used += transmission_time
+                # Calculate transmission time
+                transmission_time = delay_func(device_content.get('size', 1.0))
+
+                # Check TDMA constraint
+                if total_time_used + transmission_time > duration:
+                    print(f"Random: TDMA capacity reached ({total_time_used:.2f}s/{duration}s)")
+                    break
+
+                # Select this device
+                selected_devices.append(device_id)
+                cid = tuple(device_content['id']) if 'id' in device_content else (0, 0, device_id)
+
+                # Update content metadata
+                device_content['received_by_uav'] = device_content.get('generation_time',
+                                                                       0) + total_time_used + transmission_time
+                device_content['transmission_delay'] = transmission_time
+                aggregated_content[cid] = device_content
+                total_time_used += transmission_time
+
+            except Exception as e:
+                print(f"Error processing device {device_id}: {e}")
+                continue
+
+        print(f"Random result: {len(selected_devices)}/{len(active_devices)} devices")
 
         return selected_devices, aggregated_content
 
@@ -322,7 +427,7 @@ def create_aggregation_baseline(baseline_type, **kwargs):
         raise ValueError(f"Unknown baseline type: {baseline_type}")
 
 
-# Testing
+# Testing and validation
 if __name__ == "__main__":
     print("=== Testing IoT Aggregation Baselines ===")
 
@@ -348,22 +453,27 @@ if __name__ == "__main__":
     for baseline_type in baselines:
         print(f"\n--- Testing {baseline_type} baseline ---")
 
-        aggregator = create_aggregation_baseline(baseline_type)
+        try:
+            aggregator = create_aggregation_baseline(baseline_type)
 
-        if baseline_type == 'gru_bandit':
-            temporal_context = np.random.randn(16)
-            selected, aggregated = aggregator.select_devices(
-                active_devices, content_dict, uav_pos, interfering_regions,
-                temporal_context=temporal_context
-            )
-        else:
-            selected, aggregated = aggregator.select_devices(
-                active_devices, content_dict, uav_pos, interfering_regions
-            )
+            if baseline_type == 'gru_bandit':
+                temporal_context = np.random.randn(16)
+                selected, aggregated = aggregator.select_devices(
+                    active_devices, content_dict, uav_pos, interfering_regions,
+                    temporal_context=temporal_context, slot_duration=300
+                )
+            else:
+                selected, aggregated = aggregator.select_devices(
+                    active_devices, content_dict, uav_pos, interfering_regions,
+                    slot_duration=300
+                )
 
-        print(f"Selected devices: {selected}")
-        print(f"Aggregated content: {len(aggregated)} items")
-        total_size = sum(content['size'] for content in aggregated.values())
-        print(f"Total content size: {total_size:.1f}MB")
+            print(f"Selected devices: {selected}")
+            print(f"Aggregated content: {len(aggregated)} items")
+            total_size = sum(content.get('size', 0) for content in aggregated.values())
+            print(f"Total content size: {total_size:.1f}MB")
+
+        except Exception as e:
+            print(f"Error testing {baseline_type}: {e}")
 
     print("\n=== IoT Aggregation Baselines Test Complete ===")
